@@ -1,8 +1,8 @@
-# kube-graphql Design Document
+# kuery Design Document
 
 ## Overview
 
-kube-graphql is a GraphQL-inspired Kubernetes query API that enables rich, nested queries across multiple clusters. It syncs Kubernetes objects from multiple clusters into a SQL database and provides a powerful query engine that supports filtering, relationship traversal, sparse projection, and pagination.
+kuery is a Kubernetes query API that enables rich, nested queries across multiple clusters. It syncs Kubernetes objects from multiple clusters into a SQL database and provides a powerful query engine that supports filtering, relationship traversal, sparse projection, and pagination.
 
 ## Architecture
 
@@ -45,7 +45,7 @@ Clusters (vanilla k8s, kcp, ...)
 
 ### Group, Version, Resource
 
-- **API Group:** `query.kube-graphql.io`
+- **API Group:** `query.kuery.io`
 - **Version:** `v1alpha1`
 - **Resource:** `queries`
 - **Kind:** `Query`
@@ -61,7 +61,7 @@ Can be deployed as:
 ### Query Spec
 
 ```yaml
-apiVersion: query.kube-graphql.io/v1alpha1
+apiVersion: query.kuery.io/v1alpha1
 kind: Query
 spec:
   # --- Cluster filter ---
@@ -236,9 +236,9 @@ status:
 | `selects` | selector holder → matched | `source.selector @> target.labels` | No |
 | `selected-by` | matched → selector holder | `target.labels @> source.selector` | No |
 | `events` | object → events | `involvedObject.uid` match | No |
-| `linked` | explicit annotation ref | `kube-graphql.io/relates-to` annotation | Yes |
+| `linked` | explicit annotation ref | `kuery.io/relates-to` annotation | Yes |
 | `linked+` | transitive annotation refs | Recursive CTE on annotation refs | Yes |
-| `grouped` | bidirectional grouping | `kube-graphql.io/group` label match | Yes |
+| `grouped` | bidirectional grouping | `kuery.io/group` label match | Yes |
 | `related+` | all directions, all types | Union of all strategies, recursive | Configurable |
 
 Each relation supports the full filter spec (same as root-level filters) and its own `limit`.
@@ -251,7 +251,7 @@ Kubernetes ownerRefs are intra-cluster only. Cross-cluster relationships use con
 ```yaml
 metadata:
   annotations:
-    kube-graphql.io/relates-to: |
+    kuery.io/relates-to: |
       [{"cluster": "cluster-b", "group": "", "kind": "Secret",
         "namespace": "default", "name": "shared-cert"}]
 ```
@@ -260,7 +260,7 @@ metadata:
 ```yaml
 metadata:
   labels:
-    kube-graphql.io/group: "my-app-stack"
+    kuery.io/group: "my-app-stack"
 ```
 
 ## Database Schema
@@ -605,7 +605,7 @@ WHERE target.cluster = source.cluster
 ```sql
 SELECT target.* FROM objects target
 JOIN jsonb_array_elements(
-    (source.object->'metadata'->'annotations'->>'kube-graphql.io/relates-to')::jsonb
+    (source.object->'metadata'->'annotations'->>'kuery.io/relates-to')::jsonb
 ) AS ref ON true
 WHERE target.cluster = ref->>'cluster'
     AND target.api_group = COALESCE(ref->>'group', '')
@@ -617,7 +617,7 @@ WHERE target.cluster = ref->>'cluster'
 **Group label (bidirectional):**
 ```sql
 SELECT other.* FROM objects other
-WHERE other.labels->>'kube-graphql.io/group' = source.labels->>'kube-graphql.io/group'
+WHERE other.labels->>'kuery.io/group' = source.labels->>'kuery.io/group'
     AND other.id != source.id
 ```
 
@@ -656,7 +656,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    kube-graphql.io/refs: |
+    kuery.io/refs: |
       [
         {"path": "$.spec.secretRef.name", "targetKind": "Secret"},
         {"path": "$.spec.clusterRef.name", "targetKind": "Cluster", "targetGroup": "cluster.x-k8s.io"}
@@ -812,7 +812,7 @@ No per-object RBAC in the query engine. Authentication and authorization handled
 ## Project Structure
 
 ```
-github.com/faroshq/kube-graphql/
+github.com/faroshq/kuery/
 ├── apis/query/v1alpha1/
 │   ├── types.go              # Query CRD types
 │   ├── groupversion_info.go  # Scheme registration
@@ -836,7 +836,7 @@ github.com/faroshq/kube-graphql/
 │   └── server/
 │       ├── apiserver.go      # k8s.io/apiserver setup
 │       └── handler.go        # Query POST handler
-├── cmd/kube-graphql/
+├── cmd/kuery/
 │   └── main.go
 └── deploy/
 ```
@@ -875,8 +875,8 @@ github.com/faroshq/kube-graphql/
 - Depth limits
 
 ### Phase 6 — Cross-Cluster & Annotations
-- Annotation-based explicit refs (`kube-graphql.io/relates-to`)
-- Group label relations (`kube-graphql.io/group`)
+- Annotation-based explicit refs (`kuery.io/relates-to`)
+- Group label relations (`kuery.io/group`)
 - Cross-cluster traversal
 
 ### Phase 7 — Hardening
@@ -895,7 +895,7 @@ github.com/faroshq/kube-graphql/
 | # | Decision | Resolution |
 |---|---|---|
 | Q1 | Serving model | Generic API server (`k8s.io/apiserver`), POST-only like SAR |
-| Q2 | Module path | `github.com/faroshq/kube-graphql` |
+| Q2 | Module path | `github.com/faroshq/kuery` |
 | Q3 | What GVKs to sync | All discoverable, configurable blacklist |
 | Q4 | Database | GORM ORM, SQLite default/dev, PostgreSQL prod |
 | Q5 | Provider | kubeconfig provider |
@@ -910,7 +910,7 @@ github.com/faroshq/kube-graphql/
 | Q17 | Custom CRD ref-paths | Annotation on the CRD itself |
 | Q19 | Object versions | Storage version only, no conversion |
 | Q20 | Discovery refresh | Watch CRD changes, refresh on change |
-| Q21 | API naming | `query.kube-graphql.io`, resource `queries` |
+| Q21 | API naming | `query.kuery.io`, resource `queries` |
 | Q22 | Cluster GC | clusters table, TTL-based GC opt-in, disabled by default |
 | Q23 | Schema migrations | GORM auto-migrate |
 | Q24 | Observability | Structured logging + Prometheus metrics |
