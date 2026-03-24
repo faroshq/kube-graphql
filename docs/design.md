@@ -45,7 +45,7 @@ Clusters (vanilla k8s, kcp, ...)
 
 ### Group, Version, Resource
 
-- **API Group:** `query.kuery.io`
+- **API Group:** `kuery.io`
 - **Version:** `v1alpha1`
 - **Resource:** `queries`
 - **Kind:** `Query`
@@ -61,7 +61,7 @@ Can be deployed as:
 ### Query Spec
 
 ```yaml
-apiVersion: query.kuery.io/v1alpha1
+apiVersion: kuery.io/v1alpha1
 kind: Query
 spec:
   # --- Cluster filter ---
@@ -910,7 +910,7 @@ github.com/faroshq/kuery/
 | Q17 | Custom CRD ref-paths | Annotation on the CRD itself |
 | Q19 | Object versions | Storage version only, no conversion |
 | Q20 | Discovery refresh | Watch CRD changes, refresh on change |
-| Q21 | API naming | `query.kuery.io`, resource `queries` |
+| Q21 | API naming | `kuery.io`, resource `queries` |
 | Q22 | Cluster GC | clusters table, TTL-based GC opt-in, disabled by default |
 | Q23 | Schema migrations | GORM auto-migrate |
 | Q24 | Observability | Structured logging + Prometheus metrics |
