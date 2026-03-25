@@ -7,6 +7,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
@@ -26,6 +27,10 @@ var (
 func init() {
 	_ = v1alpha1.AddToScheme(Scheme)
 	_ = metav1.AddMetaToScheme(Scheme)
+
+	// Register meta types (ListOptions, CreateOptions, etc.) in the v1 group
+	// so the apiserver infrastructure can find them.
+	metav1.AddToGroupVersion(Scheme, schema.GroupVersion{Group: "", Version: "v1"})
 }
 
 // KueryServerConfig holds configuration for the kuery API server.

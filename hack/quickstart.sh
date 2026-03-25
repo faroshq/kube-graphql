@@ -236,9 +236,9 @@ RESULT=$(${CURL} -d '{
 }')
 echo "${RESULT}" | jq '{
   total_count: .status.count,
-  showing: (.status.objects | length),
+  showing: ((.status.objects // []) | length),
   incomplete: .status.incomplete,
-  first_5: [.status.objects[] | {cluster, name: .object.metadata.name, namespace: .object.metadata.namespace}]
+  first_5: [(.status.objects // [])[] | {cluster, name: .object.metadata.name, namespace: .object.metadata.namespace}]
 }'
 
 echo ""
@@ -267,7 +267,7 @@ RESULT=$(${CURL} -d '{
     }
   }
 }')
-echo "${RESULT}" | jq '[.status.objects[] | {
+echo "${RESULT}" | jq '[(.status.objects // [])[] | {
   cluster,
   name: .object.metadata.name,
   namespace: .object.metadata.namespace,
@@ -301,7 +301,7 @@ RESULT=$(${CURL} -d "{
     }
   }
 }")
-echo "${RESULT}" | jq '[.status.objects[] | {cluster, name: .object.metadata.name, namespace: .object.metadata.namespace}]'
+echo "${RESULT}" | jq '[(.status.objects // [])[] | {cluster, name: .object.metadata.name, namespace: .object.metadata.namespace}]'
 
 echo ""
 echo "---"
@@ -348,7 +348,7 @@ RESULT=$(${CURL} -d '{
     }
   }
 }')
-echo "${RESULT}" | jq '[.status.objects[] | {
+echo "${RESULT}" | jq '[(.status.objects // [])[] | {
   cluster,
   deployment: .object.metadata.name,
   replicasets: [(.relations.descendants // [])[] | {
@@ -395,7 +395,7 @@ RESULT=$(${CURL} -d '{
     }
   }
 }')
-echo "${RESULT}" | jq '.status.objects[0] | {
+echo "${RESULT}" | jq '(.status.objects // [])[0] | {
   deployment: .object.metadata.name,
   replicas: .object.spec.replicas,
   all_descendants: [(.relations["descendants+"] // [])[] | {name: .object.metadata.name}]
@@ -436,7 +436,7 @@ RESULT=$(${CURL} -d '{
 }')
 echo "${RESULT}" | jq '{
   count: .status.count,
-  objects: [.status.objects[] | {cluster, kind: .object.kind, name: .object.metadata.name}]
+  objects: [(.status.objects // [])[] | {cluster, kind: .object.kind, name: .object.metadata.name}]
 }'
 
 echo ""
@@ -465,7 +465,7 @@ RESULT=$(${CURL} -d '{
     }
   }
 }')
-echo "${RESULT}" | jq '{count: .status.count, objects: [.status.objects[] | {cluster, name: .object.metadata.name}]}'
+echo "${RESULT}" | jq '{count: .status.count, objects: [(.status.objects // [])[] | {cluster, name: .object.metadata.name}]}'
 
 echo ""
 bold "=========================================="

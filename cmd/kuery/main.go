@@ -3,18 +3,27 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 
+	"github.com/faroshq/kuery/apis/query/v1alpha1"
 	"github.com/faroshq/kuery/internal/server"
 	"github.com/faroshq/kuery/internal/store"
 	kuerysync "github.com/faroshq/kuery/internal/sync"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
+	"k8s.io/apiserver/pkg/authentication/user"
+	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/server/options"
+	"k8s.io/apiserver/pkg/util/compatibility"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	basecompatibility "k8s.io/component-base/compatibility"
+	openapicommon "k8s.io/kube-openapi/pkg/common"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/component-base/cli"
 	"k8s.io/klog/v2"
@@ -117,11 +126,42 @@ func (o *Options) Run(ctx context.Context) error {
 	}
 
 	// Build the generic API server config.
+	// Register effective version for the apiserver component (required by k8s.io/apiserver).
+	if compatibility.DefaultComponentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent) == nil {
+		featureGate := utilfeature.DefaultMutableFeatureGate
+		effectiveVersion := compatibility.DefaultBuildEffectiveVersion()
+		if err := compatibility.DefaultComponentGlobalsRegistry.Register(basecompatibility.DefaultKubeComponent, effectiveVersion, featureGate); err != nil {
+			return fmt.Errorf("failed to register effective version: %w", err)
+		}
+	}
+
 	recommendedConfig := genericapiserver.NewRecommendedConfig(server.Codecs)
+	recommendedConfig.EffectiveVersion = compatibility.DefaultComponentGlobalsRegistry.EffectiveVersionFor(basecompatibility.DefaultKubeComponent)
+
+	// Minimal OpenAPI V3 config (required by SSA/managed fields).
+	// Skip installing the OpenAPI handlers (no code-gen), but set the config
+	// so the apiserver can create type converters.
+	recommendedConfig.SkipOpenAPIInstallation = true
+	recommendedConfig.OpenAPIV3Config = &openapicommon.OpenAPIV3Config{
+		GetDefinitions: v1alpha1.GetOpenAPIDefinitions,
+	}
 
 	if err := o.SecureServing.ApplyTo(&recommendedConfig.SecureServing, &recommendedConfig.LoopbackClientConfig); err != nil {
 		return fmt.Errorf("failed to apply secure serving: %w", err)
 	}
+
+	// Allow all access in standalone mode. When deployed as an aggregated API
+	// server behind kube-apiserver, the parent handles auth.
+	recommendedConfig.Authentication.Authenticator = authenticator.RequestFunc(
+		func(req *http.Request) (*authenticator.Response, bool, error) {
+			return &authenticator.Response{
+				User: &user.DefaultInfo{Name: "kuery-user", Groups: []string{"system:masters"}},
+			}, true, nil
+		})
+	recommendedConfig.Authorization.Authorizer = authorizer.AuthorizerFunc(
+		func(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
+			return authorizer.DecisionAllow, "", nil
+		})
 
 	// Create sync controller.
 	syncController := kuerysync.NewSyncController(kuerysync.Config{
