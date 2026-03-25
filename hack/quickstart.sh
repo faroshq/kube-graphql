@@ -190,19 +190,30 @@ sleep 15
 
 CURL="curl -sk -X POST https://localhost:${KUERY_PORT}/apis/kuery.io/v1alpha1/queries -H Content-Type:application/json"
 
+# Helper: run a query, print the spec and full status response.
+run_query() {
+    local description="$1"
+    local body="$2"
+    echo ""
+    echo "---"
+    echo ""
+    log "${description}"
+    echo ""
+    info "Request body:"
+    echo "${body}" | jq .
+    echo ""
+    info "Response (.status):"
+    ${CURL} -d "${body}" | jq '.status'
+}
+
 # ============================================================================
 echo ""
 bold "=========================================="
 bold "  kuery quickstart — example queries"
 bold "=========================================="
-echo ""
 
-# --- Query 1: List all objects across both clusters ---
-log "Query 1: Count all synced objects across both clusters"
-echo ""
-info "POST /apis/kuery.io/v1alpha1/queries"
-cat <<'QUERY'
-{
+# --- Query 1 ---
+run_query "Query 1: Count all synced objects across both clusters (limit 5)" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -216,39 +227,10 @@ cat <<'QUERY'
       }
     }
   }
-}
-QUERY
-echo ""
-RESULT=$(${CURL} -d '{
-  "apiVersion": "kuery.io/v1alpha1",
-  "kind": "Query",
-  "spec": {
-    "count": true,
-    "limit": 5,
-    "objects": {
-      "id": true,
-      "cluster": true,
-      "object": {
-        "metadata": { "name": true, "namespace": true }
-      }
-    }
-  }
-}')
-echo "${RESULT}" | jq '{
-  total_count: .status.count,
-  showing: ((.status.objects // []) | length),
-  incomplete: .status.incomplete,
-  first_5: [(.status.objects // [])[] | {cluster, name: .object.metadata.name, namespace: .object.metadata.namespace}]
 }'
 
-echo ""
-echo "---"
-echo ""
-
-# --- Query 2: Find all Deployments ---
-log "Query 2: Find all Deployments across clusters"
-echo ""
-RESULT=$(${CURL} -d '{
+# --- Query 2 ---
+run_query "Query 2: Find all Deployments across clusters" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -266,24 +248,10 @@ RESULT=$(${CURL} -d '{
       }
     }
   }
-}')
-echo "${RESULT}" | jq '[(.status.objects // [])[] | {
-  cluster,
-  name: .object.metadata.name,
-  namespace: .object.metadata.namespace,
-  replicas: .object.spec.replicas,
-  labels: .object.metadata.labels,
-  mutablePath
-}]'
+}'
 
-echo ""
-echo "---"
-echo ""
-
-# --- Query 3: Find Deployments in a specific cluster ---
-log "Query 3: Find Deployments in ${CLUSTER_1} only"
-echo ""
-RESULT=$(${CURL} -d "{
+# --- Query 3 ---
+run_query "Query 3: Find Deployments in ${CLUSTER_1} only" "{
   \"apiVersion\": \"kuery.io/v1alpha1\",
   \"kind\": \"Query\",
   \"spec\": {
@@ -300,17 +268,10 @@ RESULT=$(${CURL} -d "{
       }
     }
   }
-}")
-echo "${RESULT}" | jq '[(.status.objects // [])[] | {cluster, name: .object.metadata.name, namespace: .object.metadata.namespace}]'
+}"
 
-echo ""
-echo "---"
-echo ""
-
-# --- Query 4: Find Deployments with their descendant ReplicaSets and Pods ---
-log "Query 4: Deployment -> ReplicaSet -> Pod tree (namespace: demo)"
-echo ""
-RESULT=$(${CURL} -d '{
+# --- Query 4 ---
+run_query "Query 4: Deployment -> ReplicaSet -> Pod tree (namespace: demo)" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -347,24 +308,10 @@ RESULT=$(${CURL} -d '{
       }
     }
   }
-}')
-echo "${RESULT}" | jq '[(.status.objects // [])[] | {
-  cluster,
-  deployment: .object.metadata.name,
-  replicasets: [(.relations.descendants // [])[] | {
-    name: .object.metadata.name,
-    pods: [(.relations.descendants // [])[] | .object.metadata.name]
-  }]
-}]'
+}'
 
-echo ""
-echo "---"
-echo ""
-
-# --- Query 5: Transitive descendants (full ownership tree) ---
-log "Query 5: Transitive descendants+ of nginx deployment"
-echo ""
-RESULT=$(${CURL} -d '{
+# --- Query 5 ---
+run_query "Query 5: Transitive descendants+ of nginx deployment (full ownership tree)" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -394,21 +341,10 @@ RESULT=$(${CURL} -d '{
       }
     }
   }
-}')
-echo "${RESULT}" | jq '(.status.objects // [])[0] | {
-  deployment: .object.metadata.name,
-  replicas: .object.spec.replicas,
-  all_descendants: [(.relations["descendants+"] // [])[] | {name: .object.metadata.name}]
 }'
 
-echo ""
-echo "---"
-echo ""
-
-# --- Query 6: Filter by namespace + label + ordering ---
-log "Query 6: All objects in 'demo' namespace labeled app=nginx, ordered by kind"
-echo ""
-RESULT=$(${CURL} -d '{
+# --- Query 6 ---
+run_query "Query 6: All objects in demo namespace labeled app=nginx, ordered by kind" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -433,20 +369,10 @@ RESULT=$(${CURL} -d '{
       }
     }
   }
-}')
-echo "${RESULT}" | jq '{
-  count: .status.count,
-  objects: [(.status.objects // [])[] | {cluster, kind: .object.kind, name: .object.metadata.name}]
 }'
 
-echo ""
-echo "---"
-echo ""
-
-# --- Query 7: OR filter — Pods or Services ---
-log "Query 7: OR filter — find all Pods OR Services in 'demo'"
-echo ""
-RESULT=$(${CURL} -d '{
+# --- Query 7 ---
+run_query "Query 7: OR filter — find all Pods OR Services in demo" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -464,8 +390,7 @@ RESULT=$(${CURL} -d '{
       }
     }
   }
-}')
-echo "${RESULT}" | jq '{count: .status.count, objects: [(.status.objects // [])[] | {cluster, name: .object.metadata.name}]}'
+}'
 
 echo ""
 bold "=========================================="
