@@ -194,6 +194,7 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 	}
 
 	var subqueries []string
+	var extraCTEs []string // Additional CTEs for transitive relations.
 	var queue []bfsNode
 
 	// Seed BFS with root's relations.
@@ -221,13 +222,48 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 			continue
 		}
 
-		childAlias := fmt.Sprintf("l%d", levelCounter)
 		parentAlias := rootAlias
 		if len(node.ancestors) > 0 {
 			parentAlias = node.ancestors[len(node.ancestors)-1].alias
 		}
 
-		// Build relation JOIN.
+		// Check if this is a transitive relation (+ suffix).
+		if IsTransitive(node.relationName) {
+			cteName := fmt.Sprintf("trans_%s_%d", strings.ReplaceAll(BaseRelation(node.relationName), "-", "_"), levelCounter)
+			ancestorsForCTE := make([]struct{ alias, join string }, len(node.ancestors))
+			for i, a := range node.ancestors {
+				ancestorsForCTE[i] = struct{ alias, join string }{a.alias, a.join}
+			}
+
+			result, err := buildTransitiveCTE(
+				BaseRelation(node.relationName),
+				cteName,
+				rootAlias,
+				rootPath,
+				parentAlias,
+				ancestorsForCTE,
+				node.relationSpec,
+				node.relationSpec.Objects,
+				spec.MaxDepth,
+				g.dialect,
+				node.level,
+				node.relationName,
+			)
+			if err != nil {
+				return nil, err
+			}
+
+			extraCTEs = append(extraCTEs, result.cteSQL)
+			subqueries = append(subqueries, result.selectSQL)
+			allArgs = append(allArgs, result.selectArgs...)
+			// Transitive relations handle all depth internally, don't enqueue children.
+			levelCounter++
+			continue
+		}
+
+		// Non-transitive relation handling (existing logic).
+		childAlias := fmt.Sprintf("l%d", levelCounter)
+
 		relType := BaseRelation(node.relationName)
 		joinClause, extraWhere, extraArgs := buildRelationJoin(relType, relationContext{
 			parentAlias: parentAlias,
@@ -237,12 +273,10 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 			refRegistry: g.refRegistry,
 		})
 
-		// Build relation-level filters on the child.
 		var relFilterWhere []string
 		var relFilterArgs []any
 		if len(node.relationSpec.Filters) > 0 {
 			for _, f := range node.relationSpec.Filters {
-				// Use a unique RT alias per level.
 				rtAlias := fmt.Sprintf("rt%d", levelCounter)
 				andClauses, filterArgs, needsRT := g.buildObjectFilterWithRT(f, childAlias, rtAlias)
 				if needsRT {
@@ -255,21 +289,17 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 			}
 		}
 
-		// Projection for this level.
 		childProj, err := g.buildProjection(node.relationSpec.Objects, childAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		// Path: parent path + child segment.
 		childPathSegment := fmt.Sprintf("'.' || lower(%s.kind) || '.' || %s.namespace || '/' || %s.name",
 			childAlias, childAlias, childAlias)
 		var pathExpr string
 		if len(node.ancestors) == 0 {
-			// Parent is root.
 			pathExpr = fmt.Sprintf("%s || %s", rootPath, childPathSegment)
 		} else {
-			// Build full path from all ancestors.
 			pathExpr = rootPath
 			for _, a := range node.ancestors {
 				aAlias := a.alias
@@ -279,7 +309,6 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 			pathExpr += fmt.Sprintf(" || %s", childPathSegment)
 		}
 
-		// Build SELECT.
 		selectCols := g.buildSelectCols(childAlias, childProj, pathExpr, false)
 
 		var subSB strings.Builder
@@ -287,7 +316,6 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 		subSB.WriteString(selectCols)
 		fmt.Fprintf(&subSB, ", %d AS level, '%s' AS relation_name", node.level, node.relationName)
 
-		// FROM: root CTE + all ancestor joins + this relation's join.
 		subSB.WriteString(" FROM root_objects ")
 		subSB.WriteString(rootAlias)
 		for _, a := range node.ancestors {
@@ -297,7 +325,6 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 		subSB.WriteString(" ")
 		subSB.WriteString(joinClause)
 
-		// WHERE: root filters already applied in CTE, only relation-level where needed.
 		var subWhere []string
 		subWhere = append(subWhere, extraWhere...)
 		subWhere = append(subWhere, relFilterWhere...)
@@ -311,8 +338,6 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 			subSB.WriteString(strings.Join(subWhere, " AND "))
 		}
 
-		// Per-relation limit: wrap in a subquery since LIMIT inside UNION ALL
-		// is not allowed in SQLite without a subquery.
 		if node.relationSpec.Limit > 0 {
 			wrapped := fmt.Sprintf("SELECT * FROM (%s LIMIT %d)", subSB.String(), node.relationSpec.Limit)
 			subqueries = append(subqueries, wrapped)
@@ -321,7 +346,6 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 		}
 		allArgs = append(allArgs, subArgs...)
 
-		// Enqueue children's relations.
 		currentAncestors := append([]ancestorLevel{}, node.ancestors...)
 		currentAncestors = append(currentAncestors, ancestorLevel{
 			alias: childAlias,
@@ -350,8 +374,26 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 	}
 
 	// Assemble UNION ALL.
+	// If there are transitive CTEs, inject them into the WITH clause.
 	var finalSB strings.Builder
-	finalSB.WriteString(rootSB.String())
+	if len(extraCTEs) > 0 {
+		// rootSB starts with "WITH root_objects AS (...) SELECT ..."
+		// We need to insert additional CTEs after root_objects.
+		rootSQL := rootSB.String()
+		// Find the end of the WITH clause: after "WITH root_objects AS (...) "
+		// Replace "WITH root_objects AS (...) SELECT" with
+		// "WITH RECURSIVE root_objects AS (...), trans_xxx AS (...) SELECT"
+		withPrefix := fmt.Sprintf("WITH root_objects AS (%s) ", rootInnerSB.String())
+		rest := strings.TrimPrefix(rootSQL, withPrefix)
+		finalSB.WriteString("WITH RECURSIVE root_objects AS (")
+		finalSB.WriteString(rootInnerSB.String())
+		finalSB.WriteString("), ")
+		finalSB.WriteString(strings.Join(extraCTEs, ", "))
+		finalSB.WriteString(" ")
+		finalSB.WriteString(rest)
+	} else {
+		finalSB.WriteString(rootSB.String())
+	}
 	for _, sq := range subqueries {
 		finalSB.WriteString(" UNION ALL ")
 		finalSB.WriteString(sq)
