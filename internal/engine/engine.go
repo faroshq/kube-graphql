@@ -44,17 +44,39 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 		return nil, fmt.Errorf("sql generation: %w", err)
 	}
 
-	// 4. Execute main query.
+	// 4. Execute query.
 	rows, err := e.store.RawDB().WithContext(ctx).Raw(gen.SQL, gen.Args...).Rows()
 	if err != nil {
 		return nil, fmt.Errorf("query execution: %w", err)
 	}
 	defer rows.Close()
 
-	// 5. Scan rows into results.
-	results, lastRow, err := e.scanRows(rows, spec)
+	// 5. Scan and assemble results.
+	var status *v1alpha1.QueryStatus
+	if gen.HasRelations {
+		status, err = e.executeWithRelations(ctx, rows, spec, gen)
+	} else {
+		status, err = e.executeFlat(ctx, rows, spec, gen)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	return status, nil
+}
+
+// executeFlat handles queries without relations (Phase 3 path).
+func (e *Engine) executeFlat(ctx context.Context, rows *sql.Rows, spec *v1alpha1.QuerySpec, gen *GeneratedQuery) (*v1alpha1.QueryStatus, error) {
+	flatRows, err := scanFlatRows(rows)
 	if err != nil {
 		return nil, fmt.Errorf("scanning results: %w", err)
+	}
+
+	// Convert flat rows to ObjectResult.
+	var results []v1alpha1.ObjectResult
+	for _, r := range flatRows {
+		result := rowToResult(r, spec.Objects)
+		results = append(results, result)
 	}
 
 	status := &v1alpha1.QueryStatus{
@@ -62,7 +84,7 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 		Warnings: []string{},
 	}
 
-	// 6. Count query if requested.
+	// Count.
 	if spec.Count {
 		var count int64
 		if err := e.store.RawDB().WithContext(ctx).Raw(gen.CountSQL, gen.CountArgs...).Scan(&count).Error; err != nil {
@@ -71,7 +93,8 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 		status.Count = &count
 	}
 
-	// 7. Build cursor if requested.
+	// Cursor.
+	lastRow := ExtractLastRowForCursor(flatRows)
 	if spec.Cursor && lastRow != nil {
 		status.Cursor = &v1alpha1.CursorResult{
 			Next:     BuildCursorToken(lastRow),
@@ -82,7 +105,7 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 		}
 	}
 
-	// 8. Check if incomplete.
+	// Incomplete.
 	if len(results) == int(spec.Limit) {
 		status.Incomplete = true
 	}
@@ -90,83 +113,75 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 	return status, nil
 }
 
-// rowResult holds scanned values from a single result row.
-type rowResult struct {
-	ID              string
-	UID             string
-	Cluster         string
-	APIGroup        string
-	APIVersion      string
-	Kind            string
-	Resource        string
-	Namespace       string
-	Name            string
-	Labels          sql.NullString
-	Annotations     sql.NullString
-	OwnerRefs       sql.NullString
-	Conditions      sql.NullString
-	CreationTS      sql.NullTime
-	ResourceVersion string
-	ProjectedObject sql.NullString
-	Path            string
+// executeWithRelations handles queries with relations using tree assembly.
+func (e *Engine) executeWithRelations(ctx context.Context, rows *sql.Rows, spec *v1alpha1.QuerySpec, gen *GeneratedQuery) (*v1alpha1.QueryStatus, error) {
+	flatRows, err := scanFlatRows(rows)
+	if err != nil {
+		return nil, fmt.Errorf("scanning results: %w", err)
+	}
+
+	// Assemble tree from flat rows.
+	results := AssembleTree(flatRows, spec)
+
+	status := &v1alpha1.QueryStatus{
+		Objects:  results,
+		Warnings: []string{},
+	}
+
+	// Count (root objects only).
+	if spec.Count {
+		var count int64
+		if err := e.store.RawDB().WithContext(ctx).Raw(gen.CountSQL, gen.CountArgs...).Scan(&count).Error; err != nil {
+			return nil, fmt.Errorf("count query: %w", err)
+		}
+		status.Count = &count
+	}
+
+	// Cursor.
+	lastRow := ExtractLastRowForCursor(flatRows)
+	if spec.Cursor && lastRow != nil {
+		status.Cursor = &v1alpha1.CursorResult{
+			Next:     BuildCursorToken(lastRow),
+			PageSize: spec.Limit,
+		}
+		if spec.Page != nil {
+			status.Cursor.Page = spec.Page.First / spec.Limit
+		}
+	}
+
+	// Incomplete — count root objects.
+	rootCount := 0
+	for _, r := range flatRows {
+		if r.Level == 0 {
+			rootCount++
+		}
+	}
+	if rootCount == int(spec.Limit) {
+		status.Incomplete = true
+	}
+
+	return status, nil
 }
 
-// scanRows reads query result rows and builds ObjectResult slice.
-func (e *Engine) scanRows(rows *sql.Rows, spec *v1alpha1.QuerySpec) ([]v1alpha1.ObjectResult, map[string]string, error) {
-	var results []v1alpha1.ObjectResult
-	var lastRow map[string]string
-
-	for rows.Next() {
-		var r rowResult
-		if err := rows.Scan(
-			&r.ID, &r.UID, &r.Cluster, &r.APIGroup, &r.APIVersion,
-			&r.Kind, &r.Resource, &r.Namespace, &r.Name,
-			&r.Labels, &r.Annotations, &r.OwnerRefs, &r.Conditions,
-			&r.CreationTS, &r.ResourceVersion,
-			&r.ProjectedObject, &r.Path,
-		); err != nil {
-			return nil, nil, fmt.Errorf("scanning row: %w", err)
+// rowToResult converts a flatRow to an ObjectResult (for flat queries).
+func rowToResult(r flatRow, objSpec *v1alpha1.ObjectsSpec) v1alpha1.ObjectResult {
+	result := v1alpha1.ObjectResult{}
+	if objSpec != nil {
+		if objSpec.ID {
+			result.ID = r.ID
 		}
-
-		result := v1alpha1.ObjectResult{}
-
-		// Include fields based on spec.
-		if spec.Objects != nil {
-			if spec.Objects.ID {
-				result.ID = r.ID
-			}
-			if spec.Objects.Cluster {
-				result.Cluster = r.Cluster
-			}
-			if spec.Objects.MutablePath {
-				result.MutablePath = MutablePath(r.APIGroup, r.APIVersion, r.Resource, r.Namespace, r.Name)
-			}
+		if objSpec.Cluster {
+			result.Cluster = r.Cluster
 		}
-
-		// Projected object.
-		if r.ProjectedObject.Valid && r.ProjectedObject.String != "" {
-			raw := json.RawMessage(r.ProjectedObject.String)
-			result.Object = &runtime.RawExtension{Raw: raw}
-		}
-
-		results = append(results, result)
-
-		// Track last row for cursor.
-		lastRow = map[string]string{
-			"name":              r.Name,
-			"namespace":         r.Namespace,
-			"kind":              r.Kind,
-			"apiGroup":          r.APIGroup,
-			"cluster":           r.Cluster,
-		}
-		if r.CreationTS.Valid {
-			lastRow["creationTimestamp"] = r.CreationTS.Time.Format(time.RFC3339)
+		if objSpec.MutablePath {
+			result.MutablePath = MutablePath(r.APIGroup, r.APIVersion, r.Resource, r.Namespace, r.Name)
 		}
 	}
 
-	if err := rows.Err(); err != nil {
-		return nil, nil, err
+	if r.ProjectedObject.Valid && r.ProjectedObject.String != "" && r.ProjectedObject.String != "null" {
+		raw := json.RawMessage(r.ProjectedObject.String)
+		result.Object = &runtime.RawExtension{Raw: raw}
 	}
 
-	return results, lastRow, nil
+	return result
 }

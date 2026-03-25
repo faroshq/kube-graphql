@@ -149,6 +149,20 @@ func deploymentRT(cluster string) *store.ResourceTypeModel {
 	}
 }
 
+func secretRT(cluster string) *store.ResourceTypeModel {
+	return &store.ResourceTypeModel{
+		Cluster:    cluster,
+		APIGroup:   "",
+		APIVersion: "v1",
+		Kind:       "Secret",
+		Singular:   "secret",
+		Resource:   "secrets",
+		ShortNames: mustJSON([]string{}),
+		Categories: mustJSON([]string{}),
+		Namespaced: true,
+	}
+}
+
 func podRT(cluster string) *store.ResourceTypeModel {
 	return &store.ResourceTypeModel{
 		Cluster:    cluster,

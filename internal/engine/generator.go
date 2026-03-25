@@ -12,32 +12,381 @@ import (
 
 // GeneratedQuery holds the generated SQL and its parameters.
 type GeneratedQuery struct {
-	SQL    string
-	Args   []any
-	CountSQL string
+	SQL       string
+	Args      []any
+	CountSQL  string
 	CountArgs []any
+	HasRelations bool
 }
 
 // Generator builds SQL from a QuerySpec.
 type Generator struct {
-	dialect string // "sqlite" or "postgres"
+	dialect     string // "sqlite" or "postgres"
+	refRegistry *RefPathRegistry
 }
 
 // NewGenerator creates a new SQL generator.
 func NewGenerator(dialect string) *Generator {
-	return &Generator{dialect: dialect}
+	return &Generator{
+		dialect:     dialect,
+		refRegistry: NewRefPathRegistry(),
+	}
 }
 
-// Generate produces SQL for a single-level (root objects) query.
-// Relations are handled in Phase 4.
+// Generate produces SQL for a query, including relation subqueries if present.
 func (g *Generator) Generate(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) {
-	var (
-		whereClauses []string
-		args         []any
-		joins        []string
-	)
+	hasRelations := spec.Objects != nil && len(spec.Objects.Relations) > 0
+	if hasRelations {
+		return g.generateWithRelations(spec)
+	}
+	return g.generateRootOnly(spec)
+}
 
+// generateRootOnly produces SQL for a single-level (root objects) query.
+func (g *Generator) generateRootOnly(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) {
 	alias := "obj"
+	rootWhere, rootArgs, rootJoins, err := g.buildRootClauses(spec, alias)
+	if err != nil {
+		return nil, err
+	}
+
+	// Projection.
+	projectionExpr, err := g.buildProjection(spec.Objects, alias)
+	if err != nil {
+		return nil, err
+	}
+
+	pathExpr := g.buildPathExpr(alias)
+
+	// Build SELECT with level and relation_name columns for compatibility.
+	selectCols := g.buildSelectCols(alias, projectionExpr, pathExpr, true)
+
+	var sb strings.Builder
+	sb.WriteString("SELECT ")
+	sb.WriteString(selectCols)
+	sb.WriteString(" FROM objects ")
+	sb.WriteString(alias)
+	for _, j := range rootJoins {
+		sb.WriteString(" ")
+		sb.WriteString(j)
+	}
+
+	args := append([]any{}, rootArgs...)
+
+	if len(rootWhere) > 0 {
+		sb.WriteString(" WHERE ")
+		sb.WriteString(strings.Join(rootWhere, " AND "))
+	}
+
+	// Cursor.
+	cursorWhere, cursorArgs := g.buildCursorFilter(spec)
+	if cursorWhere != "" {
+		if len(rootWhere) > 0 {
+			sb.WriteString(" AND ")
+		} else {
+			sb.WriteString(" WHERE ")
+		}
+		sb.WriteString(cursorWhere)
+		args = append(args, cursorArgs...)
+	}
+
+	sb.WriteString(" ORDER BY ")
+	sb.WriteString(g.buildOrderBy(spec))
+	fmt.Fprintf(&sb, " LIMIT %d", spec.Limit)
+	if spec.Page != nil && spec.Page.First > 0 && spec.Page.Cursor == "" {
+		fmt.Fprintf(&sb, " OFFSET %d", spec.Page.First)
+	}
+
+	// Count query.
+	countArgs := make([]any, len(rootArgs))
+	copy(countArgs, rootArgs)
+	var countSB strings.Builder
+	countSB.WriteString("SELECT COUNT(*) FROM objects ")
+	countSB.WriteString(alias)
+	for _, j := range rootJoins {
+		countSB.WriteString(" ")
+		countSB.WriteString(j)
+	}
+	if len(rootWhere) > 0 {
+		countSB.WriteString(" WHERE ")
+		countSB.WriteString(strings.Join(rootWhere, " AND "))
+	}
+
+	return &GeneratedQuery{
+		SQL:       sb.String(),
+		Args:      args,
+		CountSQL:  countSB.String(),
+		CountArgs: countArgs,
+	}, nil
+}
+
+// generateWithRelations produces a UNION ALL query for root + all relation levels.
+func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) {
+	rootAlias := "l0"
+
+	rootWhere, rootArgs, rootJoins, err := g.buildRootClauses(spec, rootAlias)
+	if err != nil {
+		return nil, err
+	}
+
+	rootProj, err := g.buildProjection(spec.Objects, rootAlias)
+	if err != nil {
+		return nil, err
+	}
+	rootPath := g.buildPathExpr(rootAlias)
+
+	// Build the root inner query (with ORDER BY/LIMIT) as a CTE.
+	// This avoids ORDER BY inside UNION ALL which SQLite doesn't allow.
+	var rootInnerSB strings.Builder
+	rootInnerSB.WriteString("SELECT * FROM objects ")
+	rootInnerSB.WriteString(rootAlias)
+	for _, j := range rootJoins {
+		rootInnerSB.WriteString(" ")
+		rootInnerSB.WriteString(j)
+	}
+
+	allArgs := append([]any{}, rootArgs...)
+
+	cursorWhere, cursorArgs := g.buildCursorFilter(spec)
+	rootWhereAll := append([]string{}, rootWhere...)
+	if cursorWhere != "" {
+		rootWhereAll = append(rootWhereAll, cursorWhere)
+		allArgs = append(allArgs, cursorArgs...)
+	}
+
+	if len(rootWhereAll) > 0 {
+		rootInnerSB.WriteString(" WHERE ")
+		rootInnerSB.WriteString(strings.Join(rootWhereAll, " AND "))
+	}
+
+	rootInnerSB.WriteString(" ORDER BY ")
+	rootInnerSB.WriteString(strings.ReplaceAll(g.buildOrderBy(spec), "obj.", rootAlias+"."))
+	fmt.Fprintf(&rootInnerSB, " LIMIT %d", spec.Limit)
+	if spec.Page != nil && spec.Page.First > 0 && spec.Page.Cursor == "" {
+		fmt.Fprintf(&rootInnerSB, " OFFSET %d", spec.Page.First)
+	}
+
+	// The UNION ALL uses root_objects CTE as the source for l0.
+	// Root SELECT wraps inner query via CTE.
+	rootSelect := g.buildSelectCols(rootAlias, rootProj, rootPath, false)
+
+	var rootSB strings.Builder
+	fmt.Fprintf(&rootSB, "WITH root_objects AS (%s) ", rootInnerSB.String())
+	rootSB.WriteString("SELECT ")
+	rootSB.WriteString(rootSelect)
+	rootSB.WriteString(", 0 AS level, '' AS relation_name")
+	rootSB.WriteString(" FROM root_objects ")
+	rootSB.WriteString(rootAlias)
+
+	// BFS over relation tree to generate subqueries.
+	type ancestorLevel struct {
+		alias string
+		join  string
+	}
+
+	type bfsNode struct {
+		level        int
+		relationName string
+		relationSpec v1alpha1.RelationSpec
+		// Accumulated join chain from root.
+		ancestors    []ancestorLevel
+		parentObjSpec *v1alpha1.ObjectsSpec
+	}
+
+	var subqueries []string
+	var queue []bfsNode
+
+	// Seed BFS with root's relations.
+	if spec.Objects != nil && spec.Objects.Relations != nil {
+		for relName, relSpec := range spec.Objects.Relations {
+			queue = append(queue, bfsNode{
+				level:        1,
+				relationName: relName,
+				relationSpec: relSpec,
+				ancestors:    nil,
+				parentObjSpec: spec.Objects,
+			})
+		}
+	}
+
+	// Sort queue for deterministic SQL output.
+	sort.Slice(queue, func(i, j int) bool { return queue[i].relationName < queue[j].relationName })
+
+	levelCounter := 1
+	for len(queue) > 0 {
+		node := queue[0]
+		queue = queue[1:]
+
+		if node.level > int(spec.MaxDepth) {
+			continue
+		}
+
+		childAlias := fmt.Sprintf("l%d", levelCounter)
+		parentAlias := rootAlias
+		if len(node.ancestors) > 0 {
+			parentAlias = node.ancestors[len(node.ancestors)-1].alias
+		}
+
+		// Build relation JOIN.
+		relType := BaseRelation(node.relationName)
+		joinClause, extraWhere, extraArgs := buildRelationJoin(relType, relationContext{
+			parentAlias: parentAlias,
+			childAlias:  childAlias,
+			dialect:     g.dialect,
+			filters:     node.relationSpec.Filters,
+			refRegistry: g.refRegistry,
+		})
+
+		// Build relation-level filters on the child.
+		var relFilterWhere []string
+		var relFilterArgs []any
+		if len(node.relationSpec.Filters) > 0 {
+			for _, f := range node.relationSpec.Filters {
+				// Use a unique RT alias per level.
+				rtAlias := fmt.Sprintf("rt%d", levelCounter)
+				andClauses, filterArgs, needsRT := g.buildObjectFilterWithRT(f, childAlias, rtAlias)
+				if needsRT {
+					joinClause += fmt.Sprintf(
+						" JOIN resource_types %s ON %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind",
+						rtAlias, rtAlias, childAlias, rtAlias, childAlias, rtAlias, childAlias)
+				}
+				relFilterWhere = append(relFilterWhere, andClauses...)
+				relFilterArgs = append(relFilterArgs, filterArgs...)
+			}
+		}
+
+		// Projection for this level.
+		childProj, err := g.buildProjection(node.relationSpec.Objects, childAlias)
+		if err != nil {
+			return nil, err
+		}
+
+		// Path: parent path + child segment.
+		childPathSegment := fmt.Sprintf("'.' || lower(%s.kind) || '.' || %s.namespace || '/' || %s.name",
+			childAlias, childAlias, childAlias)
+		var pathExpr string
+		if len(node.ancestors) == 0 {
+			// Parent is root.
+			pathExpr = fmt.Sprintf("%s || %s", rootPath, childPathSegment)
+		} else {
+			// Build full path from all ancestors.
+			pathExpr = rootPath
+			for _, a := range node.ancestors {
+				aAlias := a.alias
+				pathExpr += fmt.Sprintf(" || '.' || lower(%s.kind) || '.' || %s.namespace || '/' || %s.name",
+					aAlias, aAlias, aAlias)
+			}
+			pathExpr += fmt.Sprintf(" || %s", childPathSegment)
+		}
+
+		// Build SELECT.
+		selectCols := g.buildSelectCols(childAlias, childProj, pathExpr, false)
+
+		var subSB strings.Builder
+		subSB.WriteString("SELECT ")
+		subSB.WriteString(selectCols)
+		fmt.Fprintf(&subSB, ", %d AS level, '%s' AS relation_name", node.level, node.relationName)
+
+		// FROM: root CTE + all ancestor joins + this relation's join.
+		subSB.WriteString(" FROM root_objects ")
+		subSB.WriteString(rootAlias)
+		for _, a := range node.ancestors {
+			subSB.WriteString(" ")
+			subSB.WriteString(a.join)
+		}
+		subSB.WriteString(" ")
+		subSB.WriteString(joinClause)
+
+		// WHERE: root filters already applied in CTE, only relation-level where needed.
+		var subWhere []string
+		subWhere = append(subWhere, extraWhere...)
+		subWhere = append(subWhere, relFilterWhere...)
+
+		var subArgs []any
+		subArgs = append(subArgs, extraArgs...)
+		subArgs = append(subArgs, relFilterArgs...)
+
+		if len(subWhere) > 0 {
+			subSB.WriteString(" WHERE ")
+			subSB.WriteString(strings.Join(subWhere, " AND "))
+		}
+
+		// Per-relation limit: wrap in a subquery since LIMIT inside UNION ALL
+		// is not allowed in SQLite without a subquery.
+		if node.relationSpec.Limit > 0 {
+			wrapped := fmt.Sprintf("SELECT * FROM (%s LIMIT %d)", subSB.String(), node.relationSpec.Limit)
+			subqueries = append(subqueries, wrapped)
+		} else {
+			subqueries = append(subqueries, subSB.String())
+		}
+		allArgs = append(allArgs, subArgs...)
+
+		// Enqueue children's relations.
+		currentAncestors := append([]ancestorLevel{}, node.ancestors...)
+		currentAncestors = append(currentAncestors, ancestorLevel{
+			alias: childAlias,
+			join:  joinClause,
+		})
+
+		if node.relationSpec.Objects != nil && node.relationSpec.Objects.Relations != nil {
+			var childRelNames []string
+			for relName := range node.relationSpec.Objects.Relations {
+				childRelNames = append(childRelNames, relName)
+			}
+			sort.Strings(childRelNames)
+			for _, relName := range childRelNames {
+				relSpec := node.relationSpec.Objects.Relations[relName]
+				queue = append(queue, bfsNode{
+					level:        node.level + 1,
+					relationName: relName,
+					relationSpec: relSpec,
+					ancestors:    currentAncestors,
+					parentObjSpec: node.relationSpec.Objects,
+				})
+			}
+		}
+
+		levelCounter++
+	}
+
+	// Assemble UNION ALL.
+	var finalSB strings.Builder
+	finalSB.WriteString(rootSB.String())
+	for _, sq := range subqueries {
+		finalSB.WriteString(" UNION ALL ")
+		finalSB.WriteString(sq)
+	}
+	finalSB.WriteString(" ORDER BY path")
+
+	// Count query (root only).
+	countArgs := make([]any, len(rootArgs))
+	copy(countArgs, rootArgs)
+	var countSB strings.Builder
+	countSB.WriteString("SELECT COUNT(*) FROM objects ")
+	countSB.WriteString(rootAlias)
+	for _, j := range rootJoins {
+		countSB.WriteString(" ")
+		countSB.WriteString(j)
+	}
+	if len(rootWhere) > 0 {
+		countSB.WriteString(" WHERE ")
+		countSB.WriteString(strings.Join(rootWhere, " AND "))
+	}
+
+	return &GeneratedQuery{
+		SQL:          finalSB.String(),
+		Args:         allArgs,
+		CountSQL:     countSB.String(),
+		CountArgs:    countArgs,
+		HasRelations: true,
+	}, nil
+}
+
+// buildRootClauses generates WHERE, args, and JOINs for the root query level.
+func (g *Generator) buildRootClauses(spec *v1alpha1.QuerySpec, alias string) ([]string, []any, []string, error) {
+	var whereClauses []string
+	var args []any
+	var joins []string
 
 	// Cluster filter.
 	if spec.Cluster != nil {
@@ -53,7 +402,7 @@ func (g *Generator) Generate(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) 
 					whereClauses = append(whereClauses, "cl.labels @> ?::jsonb")
 					labelsJSON, _ := json.Marshal(map[string]string{k: v})
 					args = append(args, string(labelsJSON))
-				default: // sqlite
+				default:
 					whereClauses = append(whereClauses, fmt.Sprintf("json_extract(cl.labels, '$.%s') = ?", k))
 					args = append(args, v)
 				}
@@ -61,7 +410,7 @@ func (g *Generator) Generate(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) 
 		}
 	}
 
-	// Object filters (OR-ed, AND within each entry).
+	// Object filters.
 	needsRT := false
 	if spec.Filter != nil && len(spec.Filter.Objects) > 0 {
 		var orGroups []string
@@ -80,34 +429,31 @@ func (g *Generator) Generate(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) 
 		}
 	}
 
-	// Resource types JOIN for kind/category resolution.
 	if needsRT {
 		joins = append(joins, fmt.Sprintf(
 			"JOIN resource_types rt ON rt.cluster = %s.cluster AND rt.api_group = %s.api_group AND rt.kind = %s.kind",
 			alias, alias, alias))
 	}
 
-	// Projection.
-	projectionExpr := alias + ".object"
-	if spec.Objects != nil && spec.Objects.Object != nil && len(spec.Objects.Object.Raw) > 0 {
-		var err error
-		projectionExpr, err = BuildProjectionSQL(spec.Objects.Object.Raw, g.dialect, alias)
-		if err != nil {
-			return nil, fmt.Errorf("building projection: %w", err)
-		}
-	}
+	return whereClauses, args, joins, nil
+}
 
-	// Path column for tree assembly (used in later phases, but set up now).
-	var pathExpr string
-	switch g.dialect {
-	case "postgres":
-		pathExpr = fmt.Sprintf("'.' || lower(%s.kind) || '.' || %s.namespace || '/' || %s.name", alias, alias, alias)
-	default: // sqlite
-		pathExpr = fmt.Sprintf("'.' || lower(%s.kind) || '.' || %s.namespace || '/' || %s.name", alias, alias, alias)
+// buildProjection generates the projection SQL expression.
+func (g *Generator) buildProjection(objSpec *v1alpha1.ObjectsSpec, alias string) (string, error) {
+	if objSpec != nil && objSpec.Object != nil && len(objSpec.Object.Raw) > 0 {
+		return BuildProjectionSQL(objSpec.Object.Raw, g.dialect, alias)
 	}
+	return alias + ".object", nil
+}
 
-	// Build SELECT.
-	selectCols := fmt.Sprintf(
+// buildPathExpr generates the path expression for the given alias.
+func (g *Generator) buildPathExpr(alias string) string {
+	return fmt.Sprintf("'.' || lower(%s.kind) || '.' || %s.namespace || '/' || %s.name", alias, alias, alias)
+}
+
+// buildSelectCols generates the SELECT column list.
+func (g *Generator) buildSelectCols(alias, projectionExpr, pathExpr string, includeMetaCols bool) string {
+	cols := fmt.Sprintf(
 		"%s.id, %s.uid, %s.cluster, %s.api_group, %s.api_version, %s.kind, %s.resource, "+
 			"%s.namespace, %s.name, %s.labels, %s.annotations, %s.owner_refs, %s.conditions, "+
 			"%s.creation_ts, %s.resource_version, "+
@@ -119,72 +465,20 @@ func (g *Generator) Generate(spec *v1alpha1.QuerySpec) (*GeneratedQuery, error) 
 		projectionExpr,
 		pathExpr,
 	)
-
-	// Assemble main query.
-	var sb strings.Builder
-	sb.WriteString("SELECT ")
-	sb.WriteString(selectCols)
-	sb.WriteString(" FROM objects ")
-	sb.WriteString(alias)
-	for _, j := range joins {
-		sb.WriteString(" ")
-		sb.WriteString(j)
+	if includeMetaCols {
+		cols += ", 0 AS level, '' AS relation_name"
 	}
-
-	if len(whereClauses) > 0 {
-		sb.WriteString(" WHERE ")
-		sb.WriteString(strings.Join(whereClauses, " AND "))
-	}
-
-	// Cursor-based pagination (keyset).
-	cursorWhere, cursorArgs := g.buildCursorFilter(spec)
-	if cursorWhere != "" {
-		if len(whereClauses) > 0 {
-			sb.WriteString(" AND ")
-		} else {
-			sb.WriteString(" WHERE ")
-		}
-		sb.WriteString(cursorWhere)
-		args = append(args, cursorArgs...)
-	}
-
-	// ORDER BY.
-	sb.WriteString(" ORDER BY ")
-	sb.WriteString(g.buildOrderBy(spec))
-
-	// LIMIT + OFFSET.
-	fmt.Fprintf(&sb, " LIMIT %d", spec.Limit)
-	if spec.Page != nil && spec.Page.First > 0 && spec.Page.Cursor == "" {
-		fmt.Fprintf(&sb, " OFFSET %d", spec.Page.First)
-	}
-
-	// Count query.
-	var countSB strings.Builder
-	countSB.WriteString("SELECT COUNT(*) FROM objects ")
-	countSB.WriteString(alias)
-	for _, j := range joins {
-		countSB.WriteString(" ")
-		countSB.WriteString(j)
-	}
-	// Count uses the same WHERE but without cursor filter.
-	countArgs := make([]any, len(args)-len(cursorArgs))
-	copy(countArgs, args[:len(args)-len(cursorArgs)])
-	if len(whereClauses) > 0 {
-		countSB.WriteString(" WHERE ")
-		countSB.WriteString(strings.Join(whereClauses, " AND "))
-	}
-
-	return &GeneratedQuery{
-		SQL:       sb.String(),
-		Args:      args,
-		CountSQL:  countSB.String(),
-		CountArgs: countArgs,
-	}, nil
+	return cols
 }
 
 // buildObjectFilter converts a single ObjectFilter into AND-ed WHERE clauses.
+// Uses "rt" as the resource_types alias.
 func (g *Generator) buildObjectFilter(f v1alpha1.ObjectFilter, alias string) (clauses []string, args []any, needsRT bool) {
-	// GroupKind filter.
+	return g.buildObjectFilterWithRT(f, alias, "rt")
+}
+
+// buildObjectFilterWithRT converts a single ObjectFilter using a custom RT alias.
+func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAlias string) (clauses []string, args []any, needsRT bool) {
 	if f.GroupKind != nil {
 		needsRT = true
 		if f.GroupKind.APIGroup != "" {
@@ -192,40 +486,36 @@ func (g *Generator) buildObjectFilter(f v1alpha1.ObjectFilter, alias string) (cl
 			args = append(args, f.GroupKind.APIGroup)
 		}
 		if f.GroupKind.Kind != "" {
-			// Resolve via resource_types: kind, resource, singular, or short_names.
 			switch g.dialect {
 			case "postgres":
-				clauses = append(clauses, "(lower(rt.kind) = lower(?) OR lower(rt.resource) = lower(?) OR lower(rt.singular) = lower(?) OR ? = ANY(ARRAY(SELECT jsonb_array_elements_text(rt.short_names))))")
-				args = append(args, f.GroupKind.Kind, f.GroupKind.Kind, f.GroupKind.Kind, strings.ToLower(f.GroupKind.Kind))
-			default: // sqlite
-				// For SQLite we use a simpler approach: match kind or resource directly,
-				// plus check short_names JSON array.
-				clauses = append(clauses, "(lower(rt.kind) = lower(?) OR lower(rt.resource) = lower(?) OR lower(rt.singular) = lower(?) OR EXISTS (SELECT 1 FROM json_each(rt.short_names) WHERE json_each.value = lower(?)))")
-				args = append(args, f.GroupKind.Kind, f.GroupKind.Kind, f.GroupKind.Kind, strings.ToLower(f.GroupKind.Kind))
+				clauses = append(clauses, fmt.Sprintf(
+					"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR ? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.short_names))))",
+					rtAlias, rtAlias, rtAlias, rtAlias))
+			default:
+				clauses = append(clauses, fmt.Sprintf(
+					"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR EXISTS (SELECT 1 FROM json_each(%s.short_names) WHERE json_each.value = lower(?)))",
+					rtAlias, rtAlias, rtAlias, rtAlias))
 			}
+			args = append(args, f.GroupKind.Kind, f.GroupKind.Kind, f.GroupKind.Kind, strings.ToLower(f.GroupKind.Kind))
 		}
 	}
 
-	// Name.
 	if f.Name != "" {
 		clauses = append(clauses, alias+".name = ?")
 		args = append(args, f.Name)
 	}
-
-	// Namespace.
 	if f.Namespace != "" {
 		clauses = append(clauses, alias+".namespace = ?")
 		args = append(args, f.Namespace)
 	}
 
-	// Labels (matchLabels style).
 	if len(f.Labels) > 0 {
 		switch g.dialect {
 		case "postgres":
 			labelsJSON, _ := json.Marshal(f.Labels)
 			clauses = append(clauses, alias+".labels @> ?::jsonb")
 			args = append(args, string(labelsJSON))
-		default: // sqlite — use json_extract per label.
+		default:
 			for k, v := range f.Labels {
 				clauses = append(clauses, fmt.Sprintf("json_extract(%s.labels, '$.%s') = ?", alias, k))
 				args = append(args, v)
@@ -233,7 +523,6 @@ func (g *Generator) buildObjectFilter(f v1alpha1.ObjectFilter, alias string) (cl
 		}
 	}
 
-	// Conditions.
 	if len(f.Conditions) > 0 {
 		for _, cond := range f.Conditions {
 			switch g.dialect {
@@ -248,7 +537,7 @@ func (g *Generator) buildObjectFilter(f v1alpha1.ObjectFilter, alias string) (cl
 				b, _ := json.Marshal([]map[string]string{condJSON})
 				clauses = append(clauses, alias+".conditions @> ?::jsonb")
 				args = append(args, string(b))
-			default: // sqlite — use json_each to search the conditions array.
+			default:
 				condParts := []string{"json_extract(je.value, '$.type') = ?"}
 				condArgs := []any{cond.Type}
 				if cond.Status != "" {
@@ -267,7 +556,6 @@ func (g *Generator) buildObjectFilter(f v1alpha1.ObjectFilter, alias string) (cl
 		}
 	}
 
-	// CreationTimestamp.
 	if f.CreationTimestamp != nil {
 		if f.CreationTimestamp.After != nil {
 			clauses = append(clauses, alias+".creation_ts > ?")
@@ -279,24 +567,21 @@ func (g *Generator) buildObjectFilter(f v1alpha1.ObjectFilter, alias string) (cl
 		}
 	}
 
-	// ID.
 	if f.ID != "" {
 		clauses = append(clauses, alias+".id = ?")
 		args = append(args, f.ID)
 	}
 
-	// Categories.
 	if len(f.Categories) > 0 {
 		needsRT = true
 		for _, cat := range f.Categories {
 			switch g.dialect {
 			case "postgres":
-				clauses = append(clauses, "? = ANY(ARRAY(SELECT jsonb_array_elements_text(rt.categories)))")
-				args = append(args, cat)
-			default: // sqlite
-				clauses = append(clauses, "EXISTS (SELECT 1 FROM json_each(rt.categories) WHERE json_each.value = ?)")
-				args = append(args, cat)
+				clauses = append(clauses, fmt.Sprintf("? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.categories)))", rtAlias))
+			default:
+				clauses = append(clauses, fmt.Sprintf("EXISTS (SELECT 1 FROM json_each(%s.categories) WHERE json_each.value = ?)", rtAlias))
 			}
+			args = append(args, cat)
 		}
 	}
 
@@ -318,7 +603,6 @@ func (g *Generator) buildOrderBy(spec *v1alpha1.QuerySpec) string {
 		}
 	}
 
-	// Tiebreaker: namespace ASC, name ASC — always appended for stable pagination.
 	tiebreakers := map[string]bool{}
 	for _, p := range parts {
 		tiebreakers[strings.Split(p, " ")[0]] = true
@@ -330,11 +614,9 @@ func (g *Generator) buildOrderBy(spec *v1alpha1.QuerySpec) string {
 		parts = append(parts, "obj.name ASC")
 	}
 
-	// Default: name ASC if no explicit order and tiebreaker already handles it.
 	if len(spec.Order) == 0 {
 		return "obj.name ASC, obj.namespace ASC"
 	}
-
 	return strings.Join(parts, ", ")
 }
 
@@ -359,13 +641,11 @@ func (g *Generator) buildCursorFilter(spec *v1alpha1.QuerySpec) (string, []any) 
 		return "", nil
 	}
 
-	// Build keyset condition using the sort fields.
 	orderFields := spec.Order
 	if len(orderFields) == 0 {
 		orderFields = []v1alpha1.OrderSpec{{Field: "name", Direction: v1alpha1.SortAsc}}
 	}
 
-	// Add tiebreaker fields if not present.
 	hasNamespace := false
 	hasName := false
 	for _, o := range orderFields {
@@ -383,7 +663,6 @@ func (g *Generator) buildCursorFilter(spec *v1alpha1.QuerySpec) (string, []any) 
 		orderFields = append(orderFields, v1alpha1.OrderSpec{Field: "name", Direction: v1alpha1.SortAsc})
 	}
 
-	// Build tuple comparison: (col1, col2, ...) > (val1, val2, ...)
 	var cols []string
 	var args []any
 	for _, o := range orderFields {
@@ -393,7 +672,6 @@ func (g *Generator) buildCursorFilter(spec *v1alpha1.QuerySpec) (string, []any) 
 	}
 
 	op := ">"
-	// If the primary sort is DESC, we need <.
 	if len(spec.Order) > 0 && spec.Order[0].Direction == v1alpha1.SortDesc {
 		op = "<"
 	}
