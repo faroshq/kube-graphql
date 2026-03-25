@@ -46,6 +46,14 @@ Clusters (vanilla k8s, kcp, ...)
 
 ## Quick Start
 
+### Try it now (requires kind, kubectl, go, curl, jq)
+
+```bash
+./hack/quickstart.sh
+```
+
+This creates 2 kind clusters with sample workloads, starts kuery, syncs objects, and runs 7 example queries demonstrating filters, relations, projections, and cross-cluster queries. Run `./hack/quickstart.sh cleanup` to tear down.
+
 ### Build
 
 ```bash
@@ -56,6 +64,13 @@ go build -o kuery ./cmd/kuery
 
 ```bash
 ./kuery --store-driver=sqlite --store-dsn=kuery.db --secure-port=6443
+```
+
+### Run with multiple clusters (kubeconfig files)
+
+```bash
+./kuery --store-driver=sqlite --store-dsn=kuery.db --secure-port=6443 \
+  --kubeconfigs="prod=/path/to/prod.kubeconfig,staging=/path/to/staging.kubeconfig"
 ```
 
 ### Run locally (PostgreSQL)
@@ -72,6 +87,7 @@ go build -o kuery ./cmd/kuery
 | `--store-dsn` | `kuery.db` | Connection string |
 | `--secure-port` | `6443` | HTTPS port |
 | `--sync-enabled` | `false` | Enable sync controller for multi-cluster |
+| `--kubeconfigs` | | Comma-separated `name=path` pairs to sync clusters from kubeconfig files |
 
 ## Usage
 
