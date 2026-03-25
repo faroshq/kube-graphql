@@ -68,6 +68,37 @@ kind get kubeconfig --name "${CLUSTER_2}" > "${KUBECONFIG_DIR}/${CLUSTER_2}.kube
 log "Deploying sample workloads to ${CLUSTER_1}"
 kubectl --kubeconfig="${KUBECONFIG_DIR}/${CLUSTER_1}.kubeconfig" create namespace demo 2>/dev/null || true
 kubectl --kubeconfig="${KUBECONFIG_DIR}/${CLUSTER_1}.kubeconfig" -n demo apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: nginx-tls
+  labels:
+    app: nginx
+type: kubernetes.io/tls
+stringData:
+  tls.crt: "-----BEGIN CERTIFICATE-----\nMIIBkTCB+wIJALRiMLAh..."
+  tls.key: "-----BEGIN RSA PRIVATE KEY-----\nMIIBogIBAAJBAL..."
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  labels:
+    app: nginx
+data:
+  nginx.conf: |
+    server {
+      listen 80;
+      location / { proxy_pass http://localhost:8080; }
+    }
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: nginx-sa
+  labels:
+    app: nginx
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -85,11 +116,28 @@ spec:
       labels:
         app: nginx
     spec:
+      serviceAccountName: nginx-sa
       containers:
         - name: nginx
           image: nginx:1.27
           ports:
             - containerPort: 80
+          env:
+            - name: TLS_CERT_PATH
+              value: /etc/tls
+          volumeMounts:
+            - name: tls
+              mountPath: /etc/tls
+              readOnly: true
+            - name: config
+              mountPath: /etc/nginx/conf.d
+      volumes:
+        - name: tls
+          secret:
+            secretName: nginx-tls
+        - name: config
+          configMap:
+            name: nginx-config
 ---
 apiVersion: v1
 kind: Service
@@ -103,21 +151,31 @@ spec:
   ports:
     - port: 80
       targetPort: 80
----
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: nginx-config
-  labels:
-    app: nginx
-data:
-  nginx.conf: |
-    server { listen 80; }
 EOF
 
 log "Deploying sample workloads to ${CLUSTER_2}"
 kubectl --kubeconfig="${KUBECONFIG_DIR}/${CLUSTER_2}.kubeconfig" create namespace demo 2>/dev/null || true
 kubectl --kubeconfig="${KUBECONFIG_DIR}/${CLUSTER_2}.kubeconfig" -n demo apply -f - <<'EOF'
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-auth
+  labels:
+    app: redis
+stringData:
+  password: "s3cret-redis-pass"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  labels:
+    app: redis
+data:
+  redis.conf: |
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -140,6 +198,19 @@ spec:
           image: redis:7
           ports:
             - containerPort: 6379
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-auth
+                  key: password
+          volumeMounts:
+            - name: config
+              mountPath: /usr/local/etc/redis
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
 ---
 apiVersion: v1
 kind: Service
@@ -220,9 +291,10 @@ run_query "Query 1: Count all synced objects across both clusters (limit 5)" '{
     "count": true,
     "limit": 5,
     "objects": {
-      "id": true,
       "cluster": true,
       "object": {
+        "kind": true,
+        "apiVersion": true,
         "metadata": { "name": true, "namespace": true }
       }
     }
@@ -243,6 +315,7 @@ run_query "Query 2: Find all Deployments across clusters" '{
       "cluster": true,
       "mutablePath": true,
       "object": {
+        "kind": true,
         "metadata": { "name": true, "namespace": true, "labels": true },
         "spec": { "replicas": true }
       }
@@ -264,14 +337,15 @@ run_query "Query 3: Find Deployments in ${CLUSTER_1} only" "{
     \"objects\": {
       \"cluster\": true,
       \"object\": {
+        \"kind\": true,
         \"metadata\": { \"name\": true, \"namespace\": true }
       }
     }
   }
 }"
 
-# --- Query 4 ---
-run_query "Query 4: Deployment -> ReplicaSet -> Pod tree (namespace: demo)" '{
+# --- Query 4: Deployment -> RS -> Pod tree with kind visible at every level ---
+run_query "Query 4: Deployment -> ReplicaSet -> Pod -> referenced Secrets/ConfigMaps" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -286,19 +360,32 @@ run_query "Query 4: Deployment -> ReplicaSet -> Pod tree (namespace: demo)" '{
     "objects": {
       "cluster": true,
       "object": {
+        "kind": true,
         "metadata": { "name": true, "namespace": true }
       },
       "relations": {
         "descendants": {
           "objects": {
             "object": {
+              "kind": true,
               "metadata": { "name": true }
             },
             "relations": {
               "descendants": {
                 "objects": {
                   "object": {
+                    "kind": true,
                     "metadata": { "name": true }
+                  },
+                  "relations": {
+                    "references": {
+                      "objects": {
+                        "object": {
+                          "kind": true,
+                          "metadata": { "name": true }
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -311,7 +398,7 @@ run_query "Query 4: Deployment -> ReplicaSet -> Pod tree (namespace: demo)" '{
 }'
 
 # --- Query 5 ---
-run_query "Query 5: Transitive descendants+ of nginx deployment (full ownership tree)" '{
+run_query "Query 5: Transitive descendants+ of nginx (full ownership tree with kind)" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -327,6 +414,7 @@ run_query "Query 5: Transitive descendants+ of nginx deployment (full ownership 
     "objects": {
       "cluster": true,
       "object": {
+        "kind": true,
         "metadata": { "name": true },
         "spec": { "replicas": true }
       },
@@ -334,6 +422,7 @@ run_query "Query 5: Transitive descendants+ of nginx deployment (full ownership 
         "descendants+": {
           "objects": {
             "object": {
+              "kind": true,
               "metadata": { "name": true }
             }
           }
@@ -364,8 +453,8 @@ run_query "Query 6: All objects in demo namespace labeled app=nginx, ordered by 
     "objects": {
       "cluster": true,
       "object": {
-        "metadata": { "name": true, "namespace": true },
-        "kind": true
+        "kind": true,
+        "metadata": { "name": true, "namespace": true }
       }
     }
   }
@@ -386,6 +475,7 @@ run_query "Query 7: OR filter — find all Pods OR Services in demo" '{
     "objects": {
       "cluster": true,
       "object": {
+        "kind": true,
         "metadata": { "name": true }
       }
     }
