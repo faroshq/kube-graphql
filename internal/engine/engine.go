@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/faroshq/kuery/apis/query/v1alpha1"
+	"github.com/faroshq/kuery/internal/metrics"
 	"github.com/faroshq/kuery/internal/store"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -29,8 +31,11 @@ func NewEngine(s store.Store) *Engine {
 
 // Execute runs a query and returns the populated QueryStatus.
 func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alpha1.QueryStatus, error) {
+	start := time.Now()
+
 	// 1. Validate and apply defaults.
 	if err := Validate(spec); err != nil {
+		metrics.QueryErrors.WithLabelValues("validation").Inc()
 		return nil, fmt.Errorf("validation: %w", err)
 	}
 
@@ -41,12 +46,14 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 	// 3. Generate SQL.
 	gen, err := e.generator.Generate(spec)
 	if err != nil {
+		metrics.QueryErrors.WithLabelValues("generation").Inc()
 		return nil, fmt.Errorf("sql generation: %w", err)
 	}
 
 	// 4. Execute query.
 	rows, err := e.store.RawDB().WithContext(ctx).Raw(gen.SQL, gen.Args...).Rows()
 	if err != nil {
+		metrics.QueryErrors.WithLabelValues("execution").Inc()
 		return nil, fmt.Errorf("query execution: %w", err)
 	}
 	defer rows.Close()
@@ -59,24 +66,30 @@ func (e *Engine) Execute(ctx context.Context, spec *v1alpha1.QuerySpec) (*v1alph
 		status, err = e.executeFlat(ctx, rows, spec, gen)
 	}
 	if err != nil {
+		metrics.QueryErrors.WithLabelValues("assembly").Inc()
 		return nil, err
 	}
+
+	// 6. Record metrics.
+	elapsed := time.Since(start)
+	metrics.QueryDuration.WithLabelValues(
+		strconv.FormatBool(gen.HasRelations),
+		strconv.FormatBool(status.Incomplete),
+	).Observe(elapsed.Seconds())
 
 	return status, nil
 }
 
 // executeFlat handles queries without relations (Phase 3 path).
 func (e *Engine) executeFlat(ctx context.Context, rows *sql.Rows, spec *v1alpha1.QuerySpec, gen *GeneratedQuery) (*v1alpha1.QueryStatus, error) {
-	flatRows, err := scanFlatRows(rows)
+	flatRows, truncated, err := scanFlatRows(rows, MaxTotalRows)
 	if err != nil {
 		return nil, fmt.Errorf("scanning results: %w", err)
 	}
 
-	// Convert flat rows to ObjectResult.
 	var results []v1alpha1.ObjectResult
 	for _, r := range flatRows {
-		result := rowToResult(r, spec.Objects)
-		results = append(results, result)
+		results = append(results, rowToResult(r, spec.Objects))
 	}
 
 	status := &v1alpha1.QueryStatus{
@@ -84,7 +97,11 @@ func (e *Engine) executeFlat(ctx context.Context, rows *sql.Rows, spec *v1alpha1
 		Warnings: []string{},
 	}
 
-	// Count.
+	if truncated {
+		status.Incomplete = true
+		status.Warnings = append(status.Warnings, fmt.Sprintf("response truncated at %d total rows", MaxTotalRows))
+	}
+
 	if spec.Count {
 		var count int64
 		if err := e.store.RawDB().WithContext(ctx).Raw(gen.CountSQL, gen.CountArgs...).Scan(&count).Error; err != nil {
@@ -93,7 +110,6 @@ func (e *Engine) executeFlat(ctx context.Context, rows *sql.Rows, spec *v1alpha1
 		status.Count = &count
 	}
 
-	// Cursor.
 	lastRow := ExtractLastRowForCursor(flatRows)
 	if spec.Cursor && lastRow != nil {
 		status.Cursor = &v1alpha1.CursorResult{
@@ -105,8 +121,7 @@ func (e *Engine) executeFlat(ctx context.Context, rows *sql.Rows, spec *v1alpha1
 		}
 	}
 
-	// Incomplete.
-	if len(results) == int(spec.Limit) {
+	if !truncated && len(results) == int(spec.Limit) {
 		status.Incomplete = true
 	}
 
@@ -115,17 +130,21 @@ func (e *Engine) executeFlat(ctx context.Context, rows *sql.Rows, spec *v1alpha1
 
 // executeWithRelations handles queries with relations using tree assembly.
 func (e *Engine) executeWithRelations(ctx context.Context, rows *sql.Rows, spec *v1alpha1.QuerySpec, gen *GeneratedQuery) (*v1alpha1.QueryStatus, error) {
-	flatRows, err := scanFlatRows(rows)
+	flatRows, truncated, err := scanFlatRows(rows, MaxTotalRows)
 	if err != nil {
 		return nil, fmt.Errorf("scanning results: %w", err)
 	}
 
-	// Assemble tree from flat rows.
 	results := AssembleTree(flatRows, spec)
 
 	status := &v1alpha1.QueryStatus{
 		Objects:  results,
 		Warnings: []string{},
+	}
+
+	if truncated {
+		status.Incomplete = true
+		status.Warnings = append(status.Warnings, fmt.Sprintf("response truncated at %d total rows", MaxTotalRows))
 	}
 
 	// Count (root objects only).

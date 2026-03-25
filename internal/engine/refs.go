@@ -1,6 +1,9 @@
 package engine
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // RefPath defines a reference from a source kind's spec field to a target kind.
 type RefPath struct {
@@ -99,6 +102,43 @@ func NewRefPathRegistry() *RefPathRegistry {
 		r.paths[key] = append(r.paths[key], p)
 	}
 	return r
+}
+
+// Register adds custom ref paths to the registry.
+func (r *RefPathRegistry) Register(paths ...RefPath) {
+	for _, p := range paths {
+		key := p.SourceGroup + "/" + p.SourceKind
+		r.paths[key] = append(r.paths[key], p)
+	}
+}
+
+// ParseCRDRefAnnotation parses a kuery.io/refs annotation value into RefPath entries.
+// The annotation is a JSON array: [{"path": "$.spec.secretRef.name", "targetKind": "Secret", "targetGroup": ""}]
+func ParseCRDRefAnnotation(sourceKind, sourceGroup, annotationValue string) ([]RefPath, error) {
+	var entries []struct {
+		Path        string `json:"path"`
+		TargetKind  string `json:"targetKind"`
+		TargetGroup string `json:"targetGroup"`
+	}
+	if err := json.Unmarshal([]byte(annotationValue), &entries); err != nil {
+		return nil, fmt.Errorf("parsing kuery.io/refs annotation: %w", err)
+	}
+
+	var result []RefPath
+	for _, e := range entries {
+		rp := RefPath{
+			SourceKind:  sourceKind,
+			SourceGroup: sourceGroup,
+			TargetKind:  e.TargetKind,
+			TargetGroup: e.TargetGroup,
+			PGPath:      e.Path,
+			// For custom CRD refs, assume simple scalar paths (no array traversal).
+			SQLiteArrayPath: "",
+			SQLiteFieldPath: e.Path,
+		}
+		result = append(result, rp)
+	}
+	return result, nil
 }
 
 // Lookup returns all ref paths for a given source kind.

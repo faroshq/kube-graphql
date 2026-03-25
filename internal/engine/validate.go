@@ -61,5 +61,25 @@ func Validate(spec *v1alpha1.QuerySpec) error {
 		}
 	}
 
+	// Relation blocks count.
+	if spec.Objects != nil {
+		count := countRelationBlocks(spec.Objects)
+		if count > MaxRelationBlocks {
+			return fmt.Errorf("query has %d relation blocks, exceeding maximum %d", count, MaxRelationBlocks)
+		}
+	}
+
 	return nil
+}
+
+// countRelationBlocks recursively counts the total number of relation blocks in the spec.
+func countRelationBlocks(objSpec *v1alpha1.ObjectsSpec) int {
+	if objSpec == nil || len(objSpec.Relations) == 0 {
+		return 0
+	}
+	count := len(objSpec.Relations)
+	for _, rel := range objSpec.Relations {
+		count += countRelationBlocks(rel.Objects)
+	}
+	return count
 }

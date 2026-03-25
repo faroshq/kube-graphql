@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/faroshq/kuery/apis/query/v1alpha1"
@@ -73,5 +74,55 @@ func TestValidate_NegativePageFirst(t *testing.T) {
 	}
 	if err := Validate(spec); err == nil {
 		t.Fatal("expected error for negative page.first")
+	}
+}
+
+func TestValidate_MaxRelationBlocksExceeded(t *testing.T) {
+	// Build a spec with 11 relation blocks.
+	relations := make(map[string]v1alpha1.RelationSpec)
+	for i := range 11 {
+		relations[fmt.Sprintf("rel%d", i)] = v1alpha1.RelationSpec{}
+	}
+	spec := &v1alpha1.QuerySpec{
+		Objects: &v1alpha1.ObjectsSpec{
+			Relations: relations,
+		},
+	}
+	if err := Validate(spec); err == nil {
+		t.Fatal("expected error for exceeding max relation blocks")
+	}
+}
+
+func TestValidate_MaxRelationBlocksNested(t *testing.T) {
+	// 3 top-level + 3 nested = 6, within limit.
+	inner := make(map[string]v1alpha1.RelationSpec)
+	for i := range 3 {
+		inner[fmt.Sprintf("inner%d", i)] = v1alpha1.RelationSpec{}
+	}
+	outer := make(map[string]v1alpha1.RelationSpec)
+	for i := range 3 {
+		outer[fmt.Sprintf("outer%d", i)] = v1alpha1.RelationSpec{
+			Objects: &v1alpha1.ObjectsSpec{Relations: inner},
+		}
+	}
+	spec := &v1alpha1.QuerySpec{
+		Objects: &v1alpha1.ObjectsSpec{Relations: outer},
+	}
+	// 3 outer + 3*3 inner = 12 > 10. Should fail.
+	if err := Validate(spec); err == nil {
+		t.Fatal("expected error for nested relation blocks exceeding max")
+	}
+}
+
+func TestValidate_RelationBlocksWithinLimit(t *testing.T) {
+	relations := make(map[string]v1alpha1.RelationSpec)
+	for i := range 5 {
+		relations[fmt.Sprintf("rel%d", i)] = v1alpha1.RelationSpec{}
+	}
+	spec := &v1alpha1.QuerySpec{
+		Objects: &v1alpha1.ObjectsSpec{Relations: relations},
+	}
+	if err := Validate(spec); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }

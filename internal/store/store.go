@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"gorm.io/gorm"
@@ -38,6 +39,11 @@ type Store interface {
 
 	// Driver returns the database driver name ("sqlite" or "postgres").
 	Driver() string
+
+	// GC operations.
+	ListStaleClusters(ctx context.Context, expiredBefore time.Time) ([]ClusterModel, error)
+	DeleteCluster(ctx context.Context, name string) error
+	DeleteObjectsForCluster(ctx context.Context, cluster string) error
 
 	// Close closes the database connection.
 	Close() error
@@ -170,6 +176,22 @@ func (s *store) RawDB() *gorm.DB {
 
 func (s *store) Driver() string {
 	return s.driver
+}
+
+func (s *store) ListStaleClusters(ctx context.Context, expiredBefore time.Time) ([]ClusterModel, error) {
+	var clusters []ClusterModel
+	err := s.db.WithContext(ctx).
+		Where("status = ? AND last_seen < ?", "stale", expiredBefore).
+		Find(&clusters).Error
+	return clusters, err
+}
+
+func (s *store) DeleteCluster(ctx context.Context, name string) error {
+	return s.db.WithContext(ctx).Where("name = ?", name).Delete(&ClusterModel{}).Error
+}
+
+func (s *store) DeleteObjectsForCluster(ctx context.Context, cluster string) error {
+	return s.db.WithContext(ctx).Where("cluster = ?", cluster).Delete(&ObjectModel{}).Error
 }
 
 func (s *store) Close() error {

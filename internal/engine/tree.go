@@ -34,10 +34,16 @@ type flatRow struct {
 	RelationName    string
 }
 
-// scanFlatRows scans all rows from a UNION ALL query into flatRow slices.
-func scanFlatRows(rows *sql.Rows) ([]flatRow, error) {
+// scanFlatRows scans rows from a UNION ALL query into flatRow slices.
+// If maxRows > 0, stops scanning after maxRows and returns truncated=true.
+func scanFlatRows(rows *sql.Rows, maxRows int) ([]flatRow, bool, error) {
 	var result []flatRow
+	truncated := false
 	for rows.Next() {
+		if maxRows > 0 && len(result) >= maxRows {
+			truncated = true
+			break
+		}
 		var r flatRow
 		if err := rows.Scan(
 			&r.ID, &r.UID, &r.Cluster, &r.APIGroup, &r.APIVersion,
@@ -47,11 +53,14 @@ func scanFlatRows(rows *sql.Rows) ([]flatRow, error) {
 			&r.ProjectedObject, &r.Path,
 			&r.Level, &r.RelationName,
 		); err != nil {
-			return nil, fmt.Errorf("scanning flat row: %w", err)
+			return nil, false, fmt.Errorf("scanning flat row: %w", err)
 		}
 		result = append(result, r)
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return result, truncated, nil
 }
 
 // treeNode is an internal node used during tree construction.
