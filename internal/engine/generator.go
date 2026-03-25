@@ -256,7 +256,68 @@ func (g *Generator) generateWithRelations(spec *v1alpha1.QuerySpec) (*GeneratedQ
 			extraCTEs = append(extraCTEs, result.cteSQL)
 			subqueries = append(subqueries, result.selectSQL)
 			allArgs = append(allArgs, result.selectArgs...)
-			// Transitive relations handle all depth internally, don't enqueue children.
+
+			// Enqueue non-transitive sub-relations of the transitive result.
+			// These join from the CTE table (e.g., "references" under "descendants+").
+			if node.relationSpec.Objects != nil && node.relationSpec.Objects.Relations != nil {
+				for relName, relSpec := range node.relationSpec.Objects.Relations {
+					if IsTransitive(relName) {
+						continue // Skip nested transitive (not supported yet)
+					}
+					subChildAlias := fmt.Sprintf("l%d", levelCounter+1)
+					subRelType := BaseRelation(relName)
+					joinClause, extraWhere, extraArgs := buildRelationJoin(subRelType, relationContext{
+						parentAlias: cteName,
+						childAlias:  subChildAlias,
+						dialect:     g.dialect,
+						filters:     relSpec.Filters,
+						refRegistry: g.refRegistry,
+					})
+
+					// Relation-level filters.
+					var subRelFilterWhere []string
+					var subRelFilterArgs []any
+					for _, f := range relSpec.Filters {
+						subRTAlias := fmt.Sprintf("rt%d", levelCounter+1)
+						andClauses, filterArgs, _ := g.buildObjectFilterWithRT(f, subChildAlias, subRTAlias)
+						subRelFilterWhere = append(subRelFilterWhere, andClauses...)
+						subRelFilterArgs = append(subRelFilterArgs, filterArgs...)
+					}
+
+					subProj, err := g.buildProjection(relSpec.Objects, subChildAlias)
+					if err != nil {
+						return nil, err
+					}
+
+					// Path: CTE row's path + child segment.
+					subPathExpr := fmt.Sprintf("%s.path || '.' || lower(%s.kind) || '.' || %s.namespace || '/' || %s.name",
+						cteName, subChildAlias, subChildAlias, subChildAlias)
+					selectCols := g.buildSelectCols(subChildAlias, subProj, subPathExpr, false)
+
+					var subSB strings.Builder
+					subSB.WriteString("SELECT ")
+					subSB.WriteString(selectCols)
+					fmt.Fprintf(&subSB, ", %d AS level, '%s' AS relation_name", node.level+1, relName)
+					fmt.Fprintf(&subSB, " FROM %s", cteName)
+					subSB.WriteString(" ")
+					subSB.WriteString(joinClause)
+
+					var subWhere []string
+					subWhere = append(subWhere, extraWhere...)
+					subWhere = append(subWhere, subRelFilterWhere...)
+					if len(subWhere) > 0 {
+						subSB.WriteString(" WHERE ")
+						subSB.WriteString(strings.Join(subWhere, " AND "))
+					}
+
+					subqueries = append(subqueries, subSB.String())
+					var subArgs []any
+					subArgs = append(subArgs, extraArgs...)
+					subArgs = append(subArgs, subRelFilterArgs...)
+					allArgs = append(allArgs, subArgs...)
+				}
+			}
+
 			levelCounter++
 			continue
 		}

@@ -99,11 +99,11 @@ func buildTransitiveCTE(
 		cycleCheck = fmt.Sprintf("%s.visited NOT LIKE '%%,' || next.uid || ',%%'", cteName)
 	}
 
-	// Base case SELECT.
+	// Base case SELECT — includes raw `object` column for sub-relation JOINs.
 	baseCols := fmt.Sprintf(
 		"%s.id, %s.uid, %s.cluster, %s.api_group, %s.api_version, %s.kind, %s.resource, "+
 			"%s.namespace, %s.name, %s.labels, %s.annotations, %s.owner_refs, %s.conditions, "+
-			"%s.creation_ts, %s.resource_version, "+
+			"%s.creation_ts, %s.resource_version, %s.object, "+
 			"%s AS projected_object, "+
 			"%s AS path, "+
 			"1 AS depth, "+
@@ -112,7 +112,7 @@ func buildTransitiveCTE(
 			"'%s' AS relation_name",
 		childAlias, childAlias, childAlias, childAlias, childAlias, childAlias, childAlias,
 		childAlias, childAlias, childAlias, childAlias, childAlias, childAlias,
-		childAlias, childAlias,
+		childAlias, childAlias, childAlias,
 		projExpr,
 		basePathExpr,
 		baseVisited,
@@ -125,7 +125,7 @@ func buildTransitiveCTE(
 	recursiveCols := fmt.Sprintf(
 		"next.id, next.uid, next.cluster, next.api_group, next.api_version, next.kind, next.resource, "+
 			"next.namespace, next.name, next.labels, next.annotations, next.owner_refs, next.conditions, "+
-			"next.creation_ts, next.resource_version, "+
+			"next.creation_ts, next.resource_version, next.object, "+
 			"%s AS projected_object, "+
 			"%s AS path, "+
 			"%s.depth + 1, "+

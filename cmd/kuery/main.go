@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
@@ -45,6 +46,11 @@ type Options struct {
 	// Kubeconfigs is a list of name=path pairs for clusters to sync.
 	// Example: "cluster-a=/path/to/a.kubeconfig,cluster-b=/path/to/b.kubeconfig"
 	Kubeconfigs string
+
+	// SyncBlacklist overrides the default blacklist. Comma-separated resource names.
+	// Default: "secrets,events,events.events.k8s.io"
+	// Set to empty string to sync everything.
+	SyncBlacklist string
 }
 
 // NewOptions creates default options.
@@ -53,6 +59,7 @@ func NewOptions() *Options {
 		SecureServing: options.NewSecureServingOptions().WithLoopback(),
 		StoreDriver:   "sqlite",
 		StoreDSN:      "kuery.db",
+		SyncBlacklist: "secrets,events,events.events.k8s.io",
 	}
 	o.SecureServing.BindPort = 6443
 	return o
@@ -65,6 +72,7 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.StoreDSN, "store-dsn", o.StoreDSN, "Database connection string")
 	fs.BoolVar(&o.SyncEnabled, "sync-enabled", o.SyncEnabled, "Enable sync controller to watch clusters")
 	fs.StringVar(&o.Kubeconfigs, "kubeconfigs", o.Kubeconfigs, "Comma-separated list of name=path pairs for clusters to sync (e.g. cluster-a=/path/a.kubeconfig,cluster-b=/path/b.kubeconfig)")
+	fs.StringVar(&o.SyncBlacklist, "sync-blacklist", o.SyncBlacklist, "Comma-separated resources to skip syncing (default: secrets,events,events.events.k8s.io). Empty string syncs everything.")
 }
 
 // Complete fills in fields required to have valid data.
@@ -105,6 +113,29 @@ func (o *Options) parseKubeconfigs() (map[string]string, error) {
 		result[name] = path
 	}
 	return result, nil
+}
+
+// buildBlacklist creates a Blacklist from the --sync-blacklist flag.
+func (o *Options) buildBlacklist() *kuerysync.Blacklist {
+	if o.SyncBlacklist == "" {
+		return kuerysync.NewBlacklist(nil)
+	}
+	var gvrs []schema.GroupVersionResource
+	for _, entry := range strings.Split(o.SyncBlacklist, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		// Format: "resource" or "resource.group"
+		parts := strings.SplitN(entry, ".", 2)
+		resource := parts[0]
+		group := ""
+		if len(parts) == 2 {
+			group = parts[1]
+		}
+		gvrs = append(gvrs, schema.GroupVersionResource{Group: group, Resource: resource})
+	}
+	return kuerysync.NewBlacklist(gvrs)
 }
 
 // Run starts the kuery API server.
@@ -163,10 +194,11 @@ func (o *Options) Run(ctx context.Context) error {
 			return authorizer.DecisionAllow, "", nil
 		})
 
-	// Create sync controller.
+	// Create sync controller with configurable blacklist.
+	blacklist := o.buildBlacklist()
 	syncController := kuerysync.NewSyncController(kuerysync.Config{
 		Store:     s,
-		Blacklist: kuerysync.NewBlacklist(kuerysync.DefaultBlacklist),
+		Blacklist: blacklist,
 	})
 
 	// Engage clusters from --kubeconfigs flag.

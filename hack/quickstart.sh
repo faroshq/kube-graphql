@@ -131,6 +131,8 @@ spec:
               readOnly: true
             - name: config
               mountPath: /etc/nginx/conf.d
+            - name: data
+              mountPath: /var/www/html
       volumes:
         - name: tls
           secret:
@@ -138,6 +140,21 @@ spec:
         - name: config
           configMap:
             name: nginx-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: nginx-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nginx-data
+  labels:
+    app: nginx
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
@@ -238,6 +255,7 @@ go run ./cmd/kuery \
     --store-dsn="${KUBECONFIG_DIR}/kuery.db" \
     --secure-port=${KUERY_PORT} \
     --kubeconfigs="${CLUSTER_1}=${KUBECONFIG_DIR}/${CLUSTER_1}.kubeconfig,${CLUSTER_2}=${KUBECONFIG_DIR}/${CLUSTER_2}.kubeconfig" \
+    --sync-blacklist="events,events.events.k8s.io" \
     > "${KUBECONFIG_DIR}/kuery.log" 2>&1 &
 KUERY_PID=$!
 
@@ -416,7 +434,7 @@ run_query "Query 4: Deployment -> ReplicaSet -> Pod -> referenced Secrets/Config
 }'
 
 # --- Query 5 ---
-run_query "Query 5: Transitive descendants+ of nginx (full ownership tree with kind)" '{
+run_query "Query 5: Full ownership tree with referenced Secrets, ConfigMaps, PVCs" '{
   "apiVersion": "kuery.io/v1alpha1",
   "kind": "Query",
   "spec": {
@@ -442,6 +460,17 @@ run_query "Query 5: Transitive descendants+ of nginx (full ownership tree with k
             "object": {
               "kind": true,
               "metadata": { "name": true }
+            },
+            "relations": {
+              "references": {
+                "objects": {
+                  "object": {
+                    "kind": true,
+                    "apiVersion": true,
+                    "metadata": { "name": true }
+                  }
+                }
+              }
             }
           }
         }
