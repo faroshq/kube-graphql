@@ -1,5 +1,7 @@
 # kuery
 
+[![CI](https://github.com/faroshq/kuery/actions/workflows/ci.yml/badge.svg)](https://github.com/faroshq/kuery/actions/workflows/ci.yml)
+
 A Kubernetes query API server that enables rich, nested queries across multiple clusters. kuery syncs objects from multiple Kubernetes clusters into a SQL database and exposes a powerful query engine via a standard Kubernetes API (`POST /apis/kuery.io/v1alpha1/queries`).
 
 Think of it as a read-only, cross-cluster search engine for Kubernetes — submit a `Query` object and get back a nested tree of related resources with exactly the fields you need.
@@ -583,25 +585,31 @@ github.com/faroshq/kuery/
 
 ## Development
 
-### Run tests
+### Run unit tests
 
 ```bash
-go test ./... -count=1
+go test ./... -v -count=1
 ```
 
 Tests use SQLite in-memory databases. No external dependencies required.
 
-### Run with sample data
+### Run e2e tests
+
+Requires `kind` and `kubectl` installed. Creates 2 kind clusters, deploys workloads, starts kuery, and runs 36 tests covering all query patterns including cross-cluster relations.
 
 ```bash
-# Start the server
-go run ./cmd/kuery --store-driver=sqlite --store-dsn=:memory: --secure-port=6443
-
-# Submit a query
-curl -k -X POST https://localhost:6443/apis/kuery.io/v1alpha1/queries \
-  -H "Content-Type: application/json" \
-  -d '{"apiVersion":"kuery.io/v1alpha1","kind":"Query","spec":{"limit":10}}'
+go test -tags=e2e -v -count=1 -timeout=20m ./test/e2e/...
 ```
+
+### Run a single e2e test
+
+```bash
+go test -tags=e2e -v -count=1 -timeout=20m -run TestCrossCluster_Linked ./test/e2e/...
+```
+
+### CI
+
+GitHub Actions runs both unit and e2e tests on every push and PR. See [CI workflow](.github/workflows/ci.yml).
 
 ## License
 
