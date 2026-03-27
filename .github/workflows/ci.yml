@@ -30,15 +30,10 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Install kind
-        run: |
-          [ $(uname -m) = x86_64 ] && curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
-          [ $(uname -m) = aarch64 ] && curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-arm64
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
-          kind version
+      # No kind/kubectl install needed — testcontainers manages K3s containers.
+      # Docker is available by default on ubuntu-latest.
 
-      - name: Run e2e tests
+      - name: Run e2e tests (K3s + PostgreSQL via testcontainers)
         run: go test -tags=e2e -v -count=1 -timeout=20m ./test/e2e/...
 
       - name: Upload kuery logs on failure
@@ -48,9 +43,3 @@ jobs:
           name: kuery-e2e-logs
           path: /tmp/kuery-e2e-*/kuery.log
           retention-days: 7
-
-      - name: Cleanup kind clusters
-        if: always()
-        run: |
-          kind delete cluster --name kuery-e2e-alpha 2>/dev/null || true
-          kind delete cluster --name kuery-e2e-beta 2>/dev/null || true

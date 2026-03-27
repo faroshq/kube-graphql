@@ -90,9 +90,9 @@ func buildTransitiveCTE(
 	var baseVisited, recursiveVisited, cycleCheck string
 	switch dialect {
 	case "postgres":
-		baseVisited = fmt.Sprintf("ARRAY[%s.uid]", childAlias)
-		recursiveVisited = fmt.Sprintf("%s.visited || next.uid", cteName)
-		cycleCheck = fmt.Sprintf("next.uid != ALL(%s.visited)", cteName)
+		baseVisited = fmt.Sprintf("ARRAY[%s.uid::text]", childAlias)
+		recursiveVisited = fmt.Sprintf("%s.visited || next.uid::text", cteName)
+		cycleCheck = fmt.Sprintf("next.uid::text != ALL(%s.visited)", cteName)
 	default: // sqlite — use comma-separated string
 		baseVisited = fmt.Sprintf("',' || %s.uid || ','", childAlias)
 		recursiveVisited = fmt.Sprintf("%s.visited || next.uid || ','", cteName)

@@ -579,9 +579,9 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 			case "postgres":
 				clauses = append(clauses, fmt.Sprintf(
 					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND "+
-						"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR ? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.short_names)))))",
+						"(lower(%s.kind) = lower(?) OR lower(%s.resource) = lower(?) OR lower(%s.singular) = lower(?) OR ? = ANY(CASE WHEN jsonb_typeof(%s.short_names) = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(%s.short_names)) ELSE ARRAY[]::text[] END)))",
 					rtAlias, rtAlias, alias, rtAlias, alias, rtAlias, alias,
-					rtAlias, rtAlias, rtAlias, rtAlias))
+					rtAlias, rtAlias, rtAlias, rtAlias, rtAlias))
 			default:
 				clauses = append(clauses, fmt.Sprintf(
 					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND "+
@@ -670,8 +670,8 @@ func (g *Generator) buildObjectFilterWithRT(f v1alpha1.ObjectFilter, alias, rtAl
 			switch g.dialect {
 			case "postgres":
 				clauses = append(clauses, fmt.Sprintf(
-					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND ? = ANY(ARRAY(SELECT jsonb_array_elements_text(%s.categories))))",
-					rtAlias, rtAlias, alias, rtAlias, alias, rtAlias, alias, rtAlias))
+					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND ? = ANY(CASE WHEN jsonb_typeof(%s.categories) = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(%s.categories)) ELSE ARRAY[]::text[] END))",
+					rtAlias, rtAlias, alias, rtAlias, alias, rtAlias, alias, rtAlias, rtAlias))
 			default:
 				clauses = append(clauses, fmt.Sprintf(
 					"EXISTS (SELECT 1 FROM resource_types %s WHERE %s.cluster = %s.cluster AND %s.api_group = %s.api_group AND %s.kind = %s.kind AND EXISTS (SELECT 1 FROM json_each(%s.categories) WHERE json_each.value = ?))",
